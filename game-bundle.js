@@ -26,7 +26,7 @@
   function generateStairs(count, startX) {
     if (startX === undefined) startX = 0;
     if (count <= 0) return [];
-    var stairs = [{ x: startX, floor: 0 }];
+    var stairs = [{ x: startX, floor: 0, moving: false, blinking: false, phase: 0, blinkPhase: 0 }];
     var currentX = startX;
     var direction = DIR_RIGHT;
     var runLeft = randomRunLength();
@@ -41,7 +41,17 @@
       } else {
         currentX = clampedX;
       }
-      stairs.push({ x: currentX, floor: floor });
+      var step = { x: currentX, floor: floor };
+      step.moving = false;
+      step.blinking = false;
+      step.phase = Math.random() * Math.PI * 2;
+      step.blinkPhase = Math.random() * Math.PI * 2;
+      if (floor >= 10 && Math.random() < 0.2) {
+        step.blinking = true;
+      } else if (floor >= 15 && Math.random() < 0.2) {
+        step.moving = true;
+      }
+      stairs.push(step);
       runLeft--;
       if (runLeft <= 0) {
         direction = -direction;
@@ -89,7 +99,14 @@
       jumpFrom: null,
       jumpTo: null,
       pendingDirection: null,
-      currentDirection: DIR_RIGHT
+      currentDirection: DIR_RIGHT,
+      jumpTargetPixelXAtStart: null,
+      isFalling: false,
+      fallStartTime: 0,
+      fallStartX: 0,
+      fallStartY: 0,
+      fallX: 0,
+      fallY: 0
     };
   }
 
@@ -115,17 +132,6 @@
   }
 
   var CHAR_RADIUS = STEP_PIXEL * 0.4;
-  var quokkaImg = new Image();
-  quokkaImg.onerror = function () {
-    quokkaImg.src = 'assets/image-af32a40c-0d71-42ad-a5e9-637bf6c24f70.png';
-  };
-  quokkaImg.src = 'assets/quokka.png';
-
-  var logImg = new Image();
-  logImg.onerror = function () {
-    logImg.src = 'assets/image-28b2a436-1146-4743-9d25-f27ded51f250.png';
-  };
-  logImg.src = 'assets/log.png';
 
   function drawCharacter(ctx, centerX, centerY, direction, timeMs) {
     timeMs = timeMs || 0;
@@ -141,21 +147,6 @@
     var earWiggle = Math.sin(timeMs * 0.0018) * 0.06;
     var blinkPhase = (timeMs % 3200) / 3200;
     var eyesClosed = blinkPhase > 0.92 && blinkPhase < 0.96;
-
-    if (quokkaImg.complete && quokkaImg.naturalWidth > 0) {
-      var w = r * 2.2;
-      var h = r * 2.6;
-      var x = centerX - w / 2;
-      var y = centerY - h * 0.75;
-      if (direction === DIR_LEFT) {
-        ctx.translate(centerX, 0);
-        ctx.scale(-1, 1);
-        ctx.translate(-centerX, 0);
-      }
-      ctx.drawImage(quokkaImg, x, y, w, h);
-      ctx.restore();
-      return;
-    }
 
     var off = direction === DIR_RIGHT ? 1 : -1;
 
@@ -497,12 +488,6 @@
 
     ctx.save();
 
-    if (logImg.complete && logImg.naturalWidth > 0) {
-      ctx.drawImage(logImg, left, top, width, height);
-      ctx.restore();
-      return;
-    }
-
     // 1) 옆면 - 통나무 껍질 (갈색, 굴곡 라인)
     var barkG = ctx.createLinearGradient(left, top, left + depth, top);
     barkG.addColorStop(0, '#5d4e37');
@@ -606,6 +591,27 @@
   var X_ZIGZAG = 1.25;
   var STAIR_TOP_H = 18;
   var CENTER_OFFSET_FLOORS = 5;
+  var MOVE_AMPLITUDE_PX = 48;
+  var MOVE_PERIOD_MS = 1000;
+  var MOVE_MISS_THRESHOLD_PX = 38;
+  var BLINK_PERIOD_MS = 2200;
+  var FALL_GRAVITY_PX = 0.5;
+  var FALL_TERMINATE_Y = CANVAS_HEIGHT + 120;
+
+  function getStairMoveOffset(stair, timeMs) {
+    if (!stair || !stair.moving) return 0;
+    return MOVE_AMPLITUDE_PX * Math.sin(2 * Math.PI * timeMs / MOVE_PERIOD_MS + (stair.phase || 0));
+  }
+
+  function getStairVisibility(stair, timeMs) {
+    if (!stair || !stair.blinking) return 1;
+    var t = 2 * Math.PI * timeMs / BLINK_PERIOD_MS + (stair.blinkPhase || 0);
+    return (Math.sin(t) + 1) * 0.5;
+  }
+
+  function isStairVisible(stair, timeMs) {
+    return getStairVisibility(stair, timeMs) >= 0.5;
+  }
 
   function drawStairs(ctx, stairs, currentFloorIndex) {
     if (!stairs.length) return;
@@ -613,20 +619,33 @@
     var originX = CANVAS_WIDTH / 2;
     var refX = stairs[currentFloorIndex].x;
     var refFloor = currentFloorIndex;
+    var t = performance.now();
     var startFloor = Math.max(0, currentFloorIndex - 2);
     var endFloor = Math.min(stairs.length, currentFloorIndex + 12);
     for (var i = startFloor; i < endFloor; i++) {
       var s = stairs[i];
+      var alpha = 1;
+      if (s.blinking) {
+        alpha = getStairVisibility(s, t);
+        if (alpha <= 0.01) continue;
+      }
+      ctx.save();
+      if (s.blinking) ctx.globalAlpha = alpha;
       var pixelX = originX + (s.floor - refFloor - CENTER_OFFSET_FLOORS) * stepPx * FLOOR_HORIZ + (s.x - refX) * stepPx * X_ZIGZAG - stepPx / 2;
+      pixelX += getStairMoveOffset(s, t);
       var pixelY = STAIR_BASE_Y - (s.floor - refFloor) * STAIR_VERTICAL_STEP;
       drawSingleStair(ctx, pixelX, pixelY, stepPx, stepPx * 0.5);
+      ctx.restore();
     }
   }
 
-  function stairToPixel(gridX, floorIndex, refFloor, refX) {
+  function stairToPixel(gridX, floorIndex, refFloor, refX, stairs, timeMs) {
     var originX = CANVAS_WIDTH / 2;
     var stepPx = STEP_PIXEL;
     var x = originX + (floorIndex - refFloor - CENTER_OFFSET_FLOORS) * stepPx * FLOOR_HORIZ + (gridX - refX) * stepPx * X_ZIGZAG;
+    if (stairs && timeMs != null && stairs[floorIndex]) {
+      x += getStairMoveOffset(stairs[floorIndex], timeMs);
+    }
     var pixelY = STAIR_BASE_Y - (floorIndex - refFloor) * STAIR_VERTICAL_STEP;
     var stairTopY = pixelY + STAIR_TOP_H;
     var y = stairTopY - CHAR_RADIUS;
@@ -726,7 +745,7 @@
       e.preventDefault();
       if (gameMain && gameMain.focus) gameMain.focus();
     }
-    if (!state || state.phase === PHASE.GAMEOVER) return;
+    if (!state || state.phase === PHASE.GAMEOVER || state.isFalling) return;
     if (e.repeat) return;
     if (key === 'ArrowLeft') {
       state.pendingDirection = DIR_LEFT;
@@ -758,10 +777,13 @@
     }
 
     var nextStair = state.stairs[state.floorIndex + 1];
+    state.jumpStartTime = performance.now();
+    var refFloor = state.floorIndex;
+    var refX = state.characterX;
+    state.jumpTargetPixelXAtStart = stairToPixel(nextStair.x, nextStair.floor, refFloor, refX, state.stairs, state.jumpStartTime).x;
     state.isJumping = true;
     state.jumpFrom = { x: state.characterX, floor: state.floorIndex };
     state.jumpTo = { x: nextStair.x, floor: nextStair.floor };
-    state.jumpStartTime = performance.now();
     state.pendingDirection = null;
   }
 
@@ -771,6 +793,25 @@
     updateUI();
   }
 
+  function startFall(fromX, fromY) {
+    var pos;
+    if (fromX != null && fromY != null) {
+      pos = { x: fromX, y: fromY };
+    } else {
+      pos = getCharacterDisplayPos();
+    }
+    state.isFalling = true;
+    state.fallStartTime = performance.now();
+    state.fallStartX = pos.x;
+    state.fallStartY = pos.y;
+    state.fallX = pos.x;
+    state.fallY = pos.y;
+    state.isJumping = false;
+    state.jumpFrom = null;
+    state.jumpTo = null;
+    state.jumpTargetPixelXAtStart = null;
+  }
+
   function restart() {
     if (gameoverOverlay) gameoverOverlay.classList.add('hidden');
     init();
@@ -778,6 +819,28 @@
   }
 
   function completeJump() {
+    var nextStair = state.stairs[state.jumpTo.floor];
+    if (nextStair && nextStair.moving && state.jumpTargetPixelXAtStart != null) {
+      var refFloor = state.floorIndex;
+      var refX = state.characterX;
+      var now = performance.now();
+      var currentTargetX = stairToPixel(state.jumpTo.x, state.jumpTo.floor, refFloor, refX, state.stairs, now).x;
+      var movedDistance = Math.abs(currentTargetX - state.jumpTargetPixelXAtStart);
+      if (movedDistance > MOVE_MISS_THRESHOLD_PX) {
+        state.highScore = saveHighScoreIf(state.score, state.highScore);
+        var toPx = stairToPixel(state.jumpTo.x, state.jumpTo.floor, refFloor, refX, state.stairs, now);
+        startFall(toPx.x, toPx.y);
+        return;
+      }
+    }
+    if (nextStair && nextStair.blinking && !isStairVisible(nextStair, performance.now())) {
+      state.highScore = saveHighScoreIf(state.score, state.highScore);
+      var refFloor = state.floorIndex;
+      var refX = state.characterX;
+      var toPx = stairToPixel(state.jumpTo.x, state.jumpTo.floor, refFloor, refX, state.stairs, performance.now());
+      startFall(toPx.x, toPx.y);
+      return;
+    }
     state.characterX = state.jumpTo.x;
     state.floorIndex = state.jumpTo.floor;
     state.score = state.floorIndex;
@@ -788,6 +851,7 @@
     state.isJumping = false;
     state.jumpFrom = null;
     state.jumpTo = null;
+    state.jumpTargetPixelXAtStart = null;
     if (state.score > state.highScore) state.highScore = state.score;
     if (gameMain && gameMain.focus) gameMain.focus();
   }
@@ -796,11 +860,30 @@
     updateFireworks(16);
     if (!state || state.phase === PHASE.GAMEOVER) return;
 
+    if (state.isFalling) {
+      var fallElapsed = (now - state.fallStartTime) / 1000;
+      state.fallY = state.fallStartY + 0.5 * FALL_GRAVITY_PX * 800 * fallElapsed * fallElapsed;
+      state.fallX = state.fallStartX;
+      if (state.fallY >= FALL_TERMINATE_Y) {
+        state.isFalling = false;
+        state.phase = PHASE.GAMEOVER;
+        showGameOver();
+      }
+      updateUI();
+      return;
+    }
+
     if (state.isJumping && state.jumpFrom && state.jumpTo) {
       var elapsed = now - state.jumpStartTime;
       var progress = jumpProgress(elapsed);
       if (progress >= 1 || elapsed > JUMP_DURATION_MS * 2) {
         completeJump();
+      }
+    } else if (!state.isJumping && state.stairs[state.floorIndex]) {
+      var curStair = state.stairs[state.floorIndex];
+      if (curStair.blinking && !isStairVisible(curStair, now)) {
+        state.highScore = saveHighScoreIf(state.score, state.highScore);
+        startFall();
       }
     }
 
@@ -810,16 +893,17 @@
   function getCharacterDisplayPos() {
     var refFloor = state.floorIndex;
     var refX = state.characterX;
-    var from = stairToPixel(state.characterX, state.floorIndex, refFloor, refX);
+    var t = performance.now();
+    var from = stairToPixel(state.characterX, state.floorIndex, refFloor, refX, state.stairs, t);
     var x = from.x;
     var y = from.y;
     var direction = DIR_RIGHT;
 
     if (state.isJumping && state.jumpFrom && state.jumpTo) {
-      var elapsed = performance.now() - state.jumpStartTime;
+      var elapsed = t - state.jumpStartTime;
       var progress = jumpProgress(elapsed);
-      var fromPx = stairToPixel(state.jumpFrom.x, state.jumpFrom.floor, refFloor, refX);
-      var toPx = stairToPixel(state.jumpTo.x, state.jumpTo.floor, refFloor, refX);
+      var fromPx = stairToPixel(state.jumpFrom.x, state.jumpFrom.floor, refFloor, refX, state.stairs, state.jumpStartTime);
+      var toPx = stairToPixel(state.jumpTo.x, state.jumpTo.floor, refFloor, refX, state.stairs, t);
       x = lerp(fromPx.x, toPx.x, progress);
       y = lerp(fromPx.y, toPx.y, progress) - parabolaY(progress) * JUMP_AMPLITUDE;
       direction = state.jumpTo.x > state.jumpFrom.x ? DIR_RIGHT : DIR_LEFT;
@@ -836,7 +920,12 @@
     drawFireworks(ctx);
     drawStairs(ctx, state.stairs, state.floorIndex);
     if (state.phase !== PHASE.GAMEOVER) {
-      var pos = getCharacterDisplayPos();
+      var pos;
+      if (state.isFalling) {
+        pos = { x: state.fallX, y: state.fallY, direction: state.currentDirection || DIR_RIGHT };
+      } else {
+        pos = getCharacterDisplayPos();
+      }
       drawCharacter(ctx, pos.x, pos.y, pos.direction, performance.now());
     }
     update(performance.now());
